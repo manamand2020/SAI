@@ -24,6 +24,7 @@
   - [4.3 DF Workflow](#43-df-workflow)
   - [4.4 Fast failover workflow](#44-fast-failover-workflow)
   - [4.5 Single Active Redundancy workflow](#45-single-active-redundancy-workflow)
+  - [4.6 Hardware fast reroute workflow](#46-hardware-fast-reroute-workflow)
 
 
 # Revision
@@ -32,6 +33,7 @@
 | ---- | ---------  | ------------------------------------------------ | ------------------ |
 | 0.1  | Sep 23' 2024   | Jai Kumar, Rajesh Sankaran                   | Initial draft  |
 | 0.2  | Oct 23' 2024   | Rajesh Sankaran                              | Changed DF, single active attributes |
+| 0.3  | Aug 14' 2026   | Manas Kumar Mandal                           | Added hardware-based fast reroute (protection mode, protection state, switchover notification) for L3VNI routed traffic to a cross-switch multihomed bridge port |
 
 
 # 1.0  Introduction
@@ -64,6 +66,7 @@ The scope of this document is EVPN MH support for VxLAN networks.
 6. It shall be possible to implement the split horizon functionality as described in RFC 7432.
 8. It shall be possible to implement single active redundancy mode as described in RFC 7432.
 7. It shall be possible to implement a fast failover in the event of an ES going down.
+9. It shall be possible for the hardware to autonomously reroute traffic - including L3VNI routed traffic whose next hop resolves to a locally attached, cross-switch multihomed ES/bridge port - to an ECMP group of remote VTEPs upon primary path failure, without waiting on control plane intervention, and to notify the control plane once the switchover has been committed in hardware.
 
 # 3.0 EVPN-MH SAI Components
 
@@ -312,6 +315,206 @@ typedef enum _sai_vlan_member_attr_t
 
 ```
 
+### 3.2.6 Hardware Fast ReRoute (FRR) support
+
+Section 3.2.4 describes a control-plane-driven ("software") switchover: the NOS detects that an Ethernet Segment (ES)
+went down and explicitly sets `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_SET_SWITCHOVER` to redirect traffic to the
+protection next hop group.
+
+This is extended here to cover the case where a packet is *routed* (e.g. an L3VNI/symmetric-IRB lookup) to a host
+reachable over a bridge port that represents an ES which is multihomed across switches (i.e. the same ES/LAG is
+also present on one or more remote PEs). When the local ES/bridge port goes down, the hardware itself - without
+waiting for control-plane intervention - reroutes the routed traffic to a next hop group of remote VTEPs (an ECMP
+group of VXLAN tunnels towards the other PEs of the ES), the same protection next hop group already introduced in
+3.2.4. The NOS is notified asynchronously once the switchover has been committed, so it can reconcile control-plane
+state (e.g. re-advertise/withdraw EVPN routes) after the fact instead of driving the switchover itself.
+
+![SAI Object Model - Hardware Fast ReRoute of Routed Traffic](figures/sai_evpnmh_hw_frr_model.png "Figure 1: SAI Object Model - Hardware Fast ReRoute of Routed Traffic")
+__Figure 1: SAI Object Model - Hardware Fast ReRoute of Routed Traffic__
+
+The route lookup resolves to a RIF/neighbor pair, which in turn resolves to the primary bridge port (`SAI_BRIDGE_PORT_TYPE_PORT`)
+for the ES. That bridge port carries `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_MODE` and
+`SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_NEXT_HOP_GROUP_ID`, pointing to a `SAI_NEXT_HOP_GROUP_TYPE_BRIDGE_PORT`
+next hop group whose members (one per remote PE of the ES) are `SAI_NEXT_HOP_TYPE_BRIDGE_PORT` next hops resolving
+through VXLAN tunnels. On primary path failure, hardware redirects the already-resolved route/neighbor traffic to
+this next hop group without a new route lookup.
+
+The route/neighbor DMAC resolved for the (now down) primary bridge port does not apply once traffic is redirected to
+a remote-VTEP tunnel. A new tunnel attribute supplies the inner destination MAC to use for routed traffic
+encapsulated by a P2P VXLAN tunnel, defaulting to the switch-wide VXLAN router MAC. It follows the same split SAI
+already applies to the tunnel destination IP: a P2P tunnel terminates on exactly one remote PE, so the value belongs
+on the tunnel alongside `SAI_TUNNEL_ATTR_ENCAP_DST_IP`, whereas a P2MP tunnel is shared by multiple next hops that
+each carry their own destination in `SAI_NEXT_HOP_ATTR_IP` and their own inner destination MAC in
+`SAI_NEXT_HOP_ATTR_TUNNEL_MAC`. The two attributes are therefore complementary, selected by
+`SAI_TUNNEL_ATTR_PEER_MODE`, rather than two overlapping ways to set the same field. The tunnels used here are P2P,
+one per remote PE of the ES, so the tunnel attribute applies.
+
+```
+typedef enum _sai_tunnel_attr_t
+{
+...
+    /**
+     * @brief VXLAN tunnel MAC
+     *
+     * Inner destination MAC used for routed packets encapsulated by this
+     * P2P VXLAN tunnel.
+     *
+     * @type sai_mac_t
+     * @flags CREATE_AND_SET
+     * @default attrvalue SAI_SWITCH_ATTR_VXLAN_DEFAULT_ROUTER_MAC
+     * @validonly SAI_TUNNEL_ATTR_TYPE == SAI_TUNNEL_TYPE_VXLAN and SAI_TUNNEL_ATTR_PEER_MODE == SAI_TUNNEL_PEER_MODE_P2P
+     */
+    SAI_TUNNEL_ATTR_VXLAN_TUNNEL_MAC,
+...
+}
+```
+
+A new attribute controls whether the switchover for a bridge port is driven by software (existing behavior, default)
+or autonomously by hardware, and if by hardware, whether it automatically reverts to the primary path once it
+recovers.
+
+```
+typedef enum _sai_bridge_port_protection_mode_t
+{
+    /** Software switchover. Control plane determines the switchover behavior */
+    SAI_BRIDGE_PORT_PROTECTION_MODE_SOFTWARE,
+
+    /** Hardware switchover. Switches back to the bridge port once it recovers */
+    SAI_BRIDGE_PORT_PROTECTION_MODE_HARDWARE,
+
+    /** Hardware switchover. Does not switch back to the bridge port once it recovers */
+    SAI_BRIDGE_PORT_PROTECTION_MODE_HARDWARE_NON_REVERTIVE,
+
+} sai_bridge_port_protection_mode_t;
+
+typedef enum _sai_bridge_port_attr_t
+{
+...
+    /**
+     * @brief Protection switchover mode
+     *
+     * Applies only when SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_NEXT_HOP_GROUP_ID
+     * is set; otherwise the value is ignored.
+     *
+     * @type sai_bridge_port_protection_mode_t
+     * @flags CREATE_AND_SET
+     * @default SAI_BRIDGE_PORT_PROTECTION_MODE_SOFTWARE
+     * @validonly SAI_BRIDGE_PORT_ATTR_TYPE == SAI_BRIDGE_PORT_TYPE_PORT
+     */
+    SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_MODE,
+...
+}
+```
+
+The companion proposal `doc/SAI-Proposal-HW-FRR.md` signals hardware-managed protection differently, by giving the
+backup group the type `SAI_NEXT_HOP_GROUP_TYPE_HW_PROTECTION` within an enclosing
+`SAI_NEXT_HOP_GROUP_TYPE_PROTECTION` group. That works there because both the primary and the backup are next hop
+groups, so the pair has a containing object whose type can carry the hint. In the case described here the primary
+path is the bridge port itself rather than a next hop group member, and the bridge port is the only object that sees
+both sides of the pair, so the policy is expressed as an attribute on it. The type slot of the protection group is
+in any case unavailable: it must be `SAI_NEXT_HOP_GROUP_TYPE_BRIDGE_PORT` (3.2.1) in order to hold
+`SAI_NEXT_HOP_TYPE_BRIDGE_PORT` members, and the two values are mutually exclusive in the same enum. An attribute is
+also the better operational fit, since `SAI_NEXT_HOP_GROUP_ATTR_TYPE` is `CREATE_ONLY` - a type-based hint could not
+be moved between software and hardware control at run time - and a single type value could not carry the
+revertive/non-revertive distinction without a separate group type per combination.
+
+A read-only attribute reports which path (primary bridge port or protection next hop group) is currently committed
+in hardware, under either protection mode:
+
+```
+typedef enum _sai_bridge_port_protection_state_t
+{
+    /** Primary path is committed in hardware */
+    SAI_BRIDGE_PORT_PROTECTION_STATE_PRIMARY,
+
+    /** Protection path is committed in hardware */
+    SAI_BRIDGE_PORT_PROTECTION_STATE_PROTECTION,
+
+} sai_bridge_port_protection_state_t;
+
+typedef enum _sai_bridge_port_attr_t
+{
+...
+    /**
+     * @brief Protection switchover state
+     *
+     * Path currently committed in hardware. Valid only for
+     * SAI_BRIDGE_PORT_TYPE_PORT; otherwise, or when no protection next hop
+     * group is associated, returns SAI_BRIDGE_PORT_PROTECTION_STATE_PRIMARY.
+     *
+     * @type sai_bridge_port_protection_state_t
+     * @flags READ_ONLY
+     */
+    SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE,
+...
+}
+```
+
+Finally, a notification callback informs the NOS whenever hardware commits a switchover, so that the control plane
+can reconcile its state instead of having to poll `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE`. A
+notification is emitted after the data plane selection is committed; a
+`SAI_BRIDGE_PORT_PROTECTION_EVENT_SWITCHOVER_FAILED` notification reports the unchanged
+authoritative `current_state`. Notifications are advisory - `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE`
+remains the source of truth. A hardware-origin timestamp is left out for now, pending SAI defining a clock contract.
+
+Notifications cover hardware-initiated transitions only. A switchover the NOS requests through
+`SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_SET_SWITCHOVER` reports its outcome synchronously in the return status of
+`set_bridge_port_attribute()`, and the resulting path is readable immediately from
+`SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE`, so no asynchronous event is needed for that case.
+
+```
+typedef enum _sai_bridge_port_protection_event_t
+{
+    /** Primary path failed */
+    SAI_BRIDGE_PORT_PROTECTION_EVENT_PRIMARY_FAILURE,
+
+    /** Primary path recovered */
+    SAI_BRIDGE_PORT_PROTECTION_EVENT_PRIMARY_RECOVERY,
+
+    /** Switchover attempt failed. Committed state is unchanged */
+    SAI_BRIDGE_PORT_PROTECTION_EVENT_SWITCHOVER_FAILED,
+
+} sai_bridge_port_protection_event_t;
+
+typedef struct _sai_bridge_port_hw_protection_switchover_notification_data_t
+{
+    /** @objects SAI_OBJECT_TYPE_BRIDGE_PORT */
+    sai_object_id_t bridge_port_id;
+
+    /** Protection state before the switchover */
+    sai_bridge_port_protection_state_t previous_state;
+
+    /** Protection state after the switchover */
+    sai_bridge_port_protection_state_t current_state;
+
+    /** Reason for the switchover */
+    sai_bridge_port_protection_event_t reason;
+
+} sai_bridge_port_hw_protection_switchover_notification_data_t;
+
+typedef void (*sai_bridge_port_hw_protection_switchover_notification_fn)(
+        _In_ uint32_t count,
+        _In_ const sai_bridge_port_hw_protection_switchover_notification_data_t *events);
+```
+
+The callback is registered as a switch attribute, mirroring the existing next hop group HW protection notification
+(`SAI_SWITCH_ATTR_NEXT_HOP_GROUP_HW_PROTECTION_SWITCHOVER_NOTIFY`):
+
+```
+typedef enum _sai_switch_attr_t
+{
+...
+    /**
+     * @brief Bridge port HW protection switchover notification callback function passed to the adapter.
+     *
+     * @type sai_pointer_t sai_bridge_port_hw_protection_switchover_notification_fn
+     * @flags CREATE_AND_SET
+     * @default NULL
+     */
+    SAI_SWITCH_ATTR_BRIDGE_PORT_HW_PROTECTION_SWITCHOVER_NOTIFY,
+...
+}
+```
 
 # 4.0 Sample Workflow
 
@@ -321,7 +524,7 @@ This section describes the SAI object usage for different EVPN MH scenarios.
 ## 4.1 Known Unicast workflow
 
 ![EVPN Multihoming](figures/sai_evpnmh_unicast.png "Figure 1: Known Unicast Packet Flow")
-__Figure 1: Known Unicast Packet Flow__
+__Figure 2: Known Unicast Packet Flow__
 
 At VTEP5 the following objects are created.
 
@@ -491,7 +694,7 @@ At VTEP5 the following objects are created.
   PR. It is being elaborated here for completeness.
 
 ![EVPN Multihoming](figures/sai_evpnmh_splithorizon.png "Figure 1: Split Horizon")
-__Figure 2: Split Horizon Flow__
+__Figure 3: Split Horizon Flow__
 
   At VTEP1 the following SAI objects with sub types are created.
 
@@ -544,7 +747,7 @@ __Figure 2: Split Horizon Flow__
 ## 4.3 DF workflow
 
 ![EVPN Multihoming](figures/sai_evpnmh_df.png "Figure 1: Designated Forwarder")
-__Figure 3: Designated Forwarder Flow__
+__Figure 4: Designated Forwarder Flow__
 
 - DF settings
   - At VTEP1 lag_bp_oid for LAG is marked as NON_DF.
@@ -563,7 +766,7 @@ __Figure 3: Designated Forwarder Flow__
 ## 4.4 Fast Failover workflow
 
 ![EVPN Multihoming](figures/sai_evpnmh_failover.png "Figure 1: Failover")
-__Figure 4: Failover Flow__
+__Figure 5: Failover Flow__
 
 
 At VTEP1, the following objects are created.
@@ -595,7 +798,7 @@ At VTEP1, the following objects are created.
 ## 4.5 Single Active Redundancy workflow
 
 ![EVPN Multihoming](figures/sai_evpnmh_singleactive.png "Figure 1: Single Active redundancy")
-__Figure 5: Single Active Redundancy Flow__
+__Figure 6: Single Active Redundancy Flow__
 
 - Bridgeport settings to achieve single active redundancy
 
@@ -615,7 +818,76 @@ __Figure 5: Single Active Redundancy Flow__
 
 ```
 
+## 4.6 Hardware fast reroute workflow
 
+This workflow illustrates the case introduced in 3.2.6: LAG-1, the ES connecting to the dual/multi-homed CE, is
+present on both VTEP1 and VTEP4 (i.e. the bridge port representing LAG-1 is multihomed across switches). A packet
+routed at VTEP1 (e.g. an L3VNI/symmetric-IRB lookup) resolves its next hop to a host attached over `bp_lag_oid_1`.
+If LAG-1 goes down locally on VTEP1, hardware alone reroutes that routed traffic to VTEP4 over the VXLAN fabric,
+without waiting for the NOS to detect the failure and reprogram anything.
+
+![Hardware Fast ReRoute Flow](figures/sai_evpnmh_hw_frr_flow.png "Figure 7: Hardware Fast ReRoute Flow")
+__Figure 7: Hardware Fast ReRoute Flow__
+
+At VTEP1, the following objects are created.
+
+  - `bp_lag_oid_1` of type `SAI_BRIDGE_PORT_TYPE_PORT` for the local LAG-1 attachment of the ES.
+
+  - Tunnel, next hop, and next hop group objects towards VTEP4 (the other PE for this ES), as described in 4.1 for
+    known unicast, yielding `nh_grp_oid_2` of type `SAI_NEXT_HOP_GROUP_TYPE_BRIDGE_PORT`.
+
+  - The protection next hop group, protection mode, and (at switch init) the switchover notification callback are
+    set on `bp_lag_oid_1`:
+
+```
+    sai_attribute_t attr;
+
+    attr.id = SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_NEXT_HOP_GROUP_ID;
+    attr.value.oid = nh_grp_oid_2;
+    status = sai_bridge_api->set_bridge_port_attribute(bp_lag_oid_1, &attr);
+
+    attr.id = SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_MODE;
+    attr.value.s32 = SAI_BRIDGE_PORT_PROTECTION_MODE_HARDWARE; /* or _HARDWARE_NON_REVERTIVE */
+    status = sai_bridge_api->set_bridge_port_attribute(bp_lag_oid_1, &attr);
+
+    /* Registered once, at switch initialization */
+    sai_attribute_t switch_attr;
+    switch_attr.id = SAI_SWITCH_ATTR_BRIDGE_PORT_HW_PROTECTION_SWITCHOVER_NOTIFY;
+    switch_attr.value.ptr = (void *)on_bridge_port_hw_protection_switchover;
+    status = sai_switch_api->set_switch_attribute(gSwitchId, &switch_attr);
+
+```
+
+  - When LAG-1 fails, the ASIC autonomously commits the switchover to `nh_grp_oid_2` and invokes the registered
+    callback. The NOS treats the notification as advisory and reconciles by reading back
+    `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE` (e.g. before updating EVPN route advertisements for the ES).
+
+```
+    void on_bridge_port_hw_protection_switchover(
+            uint32_t count,
+            const sai_bridge_port_hw_protection_switchover_notification_data_t *events)
+    {
+        for (uint32_t i = 0; i < count; i++)
+        {
+            /* events[i].bridge_port_id == bp_lag_oid_1
+             * events[i].previous_state == SAI_BRIDGE_PORT_PROTECTION_STATE_PRIMARY
+             * events[i].current_state  == SAI_BRIDGE_PORT_PROTECTION_STATE_PROTECTION
+             * events[i].reason         == SAI_BRIDGE_PORT_PROTECTION_EVENT_PRIMARY_FAILURE
+             */
+
+            sai_attribute_t attr;
+            attr.id = SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_PROTECTION_STATE;
+            sai_bridge_api->get_bridge_port_attribute(events[i].bridge_port_id, 1, &attr);
+            /* reconcile control-plane state against attr.value.s32 */
+        }
+    }
+
+```
+
+  - If `SAI_BRIDGE_PORT_PROTECTION_MODE_HARDWARE` was used and LAG-1 recovers, hardware automatically reverts and a
+    second notification is delivered with `reason == SAI_BRIDGE_PORT_PROTECTION_EVENT_PRIMARY_RECOVERY`. With
+    `SAI_BRIDGE_PORT_PROTECTION_MODE_HARDWARE_NON_REVERTIVE`, the traffic stays on `nh_grp_oid_2` until the NOS
+    explicitly reverts it (e.g. via `SAI_BRIDGE_PORT_ATTR_BRIDGE_PORT_SET_SWITCHOVER`).
 
 
 
